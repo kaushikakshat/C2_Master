@@ -1,0 +1,20 @@
+# macOS system files (Important for M1 users)
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Logs and databases
+*.log
+*.sqlite
+
+# Common Developer Tools
+.vscode/
+.idea/
+node_modules/
+build/
+dist/
+__pycache__/
+*.pyc
+.env
+*.db
